@@ -1,0 +1,170 @@
+# MedSRDet — reference experiment configuration
+#
+# Every value below follows the manuscript under review:
+#   - data / target construction : Section 4.2, Appendix D (Tables D.1)
+#   - optimisation               : Section 4.3, Table 5
+#   - CMCL views                 : Section 3.3, Appendix C (Table C.1)
+#   - detection objective        : Section 3.5, Appendix E (Table E.1)
+#   - joint objective            : Eq. (5)(6)
+#
+# No dataset is redistributed; see README section 5.
+
+# ---------------------------------------------------------------------------
+# Common preprocessing (Appendix D.1, Table D.1)
+# ---------------------------------------------------------------------------
+common:
+  hr_size: 640                 # aspect-ratio-preserving letterbox output
+  lr_size: 160                 # bicubic downsampling of the HR target
+  scale: 4                     # MFASR reconstruction factor
+  intensity_range: [0.0, 1.0]  # network input range
+  resample_spacing: [1.0, 1.0, 1.0]   # isotropic voxel spacing (mm), CT/MRI
+  image_interpolation: linear
+  mask_interpolation: nearest
+  split_ratio: [0.7, 0.1, 0.2] # patient-level train / val / test
+  split_level: patient
+  seeds: [42, 43, 44, 45, 46]
+
+# ---------------------------------------------------------------------------
+# Dataset-specific preprocessing and 2D target construction
+# ---------------------------------------------------------------------------
+datasets:
+  brats2021:                                   # Appendix D.2
+    modality: MRI
+    sequences: [t1ce, t2, flair]               # three-channel MRI input
+    normalization: per-volume-nonzero-zscore
+    clip: [-5.0, 5.0]
+    lesion_target: ET                          # enhancing tumor, label 4
+    target_labels: [4]
+    target_construction: axial-connected-components-tight-bbox
+    connectivity: 8
+    num_classes: 1
+    class_names: [tumor_core]
+    negatives:                                 # Appendix D.4
+      enabled: true
+      pos_neg_ratio: 1.0
+      resample_every_epoch: true
+
+  luna16:                                      # Appendix D.3
+    modality: CT
+    hu_clip: [-1000, 400]
+    normalization: linear-to-01
+    lesion_target: nodule
+    target_construction: physical-center-diameter-to-slice-cross-section
+    num_classes: 1
+    class_names: [nodule]
+    negatives:
+      enabled: true
+      pos_neg_ratio: 1.0
+      resample_every_epoch: true
+
+  vindrcxr:                                    # Appendix D.4
+    modality: X-ray
+    percentile_clip: [0.5, 99.5]
+    normalization: linear-to-01
+    channels: 3                                # grayscale replicated x3
+    lesion_target: native-2d-boxes
+    num_classes: 14                            # dataset-specific label space
+    negatives:
+      enabled: false                           # image-level annotations kept
+
+# ---------------------------------------------------------------------------
+# Model (Methods 3.1-3.4, Tables 2-4, Appendix B)
+# ---------------------------------------------------------------------------
+model:
+  backbone: yolov12n            # COCO-pretrained, fully fine-tuned
+  backbone_weight: yolo12n.pt   # resolved by ultralytics on first use
+  feature_levels: [P3, P4, P5]
+  feature_strides: [8, 16, 32]
+  unified_channels: 256
+
+  mfasr:                        # Table 2
+    in_channels: 3
+    out_channels: 3
+    num_feat: 64
+    num_block: 23
+    growth_channels: 32
+    beta: 0.2
+    scale: 4
+    upsampling: two-stage-nearest-neighbour
+
+  sr_loss:                      # Eq. (1), Table 2
+    lambda_pix: 1.0             # L1
+    lambda_freq: 0.1            # FFT magnitude spectrum only (no phase)
+    lambda_perc: 0.05           # VGG-19 ReLU5_4, frozen
+
+  cmcl:                         # Table 3, Appendix B/C
+    feature_dim: 256            # P3/P4/P5 projected to 256 independently
+    projection: [256, 128]      # 2-layer MLP, ReLU, dropout 0.2
+    hidden_dim: 256
+    dropout: 0.2
+    temperature: 0.07
+    lambda_reg: 1.0e-4          # Frobenius norm on projection-head weights
+    momentum: 0.999
+    queue_size: 65536
+    scale_aggregation: element-wise-mean
+    spatial_aggregation: global-average-pooling
+
+  medhead:                      # Table 4
+    channels: 256
+    scale_hidden: 64
+    deform_kernel: 3
+    deform_groups: 8
+    residual_gamma: 0.2
+    regression_out: 4           # dx, dy, dw, dh
+
+# ---------------------------------------------------------------------------
+# CMCL lesion-patch construction and augmentation (Section 3.3, Table C.1)
+# ---------------------------------------------------------------------------
+cmcl_views:
+  patch_size: 224
+  margin_ratio: 0.25            # crop side = 1.5 * max(w, h)
+  out_of_bounds: border-replication
+  resize: bilinear
+  mfaser_downsample: 56         # bicubic 224 -> 56 -> MFASR x4 -> 224
+  augmentation:
+    rotation:      {p: 0.5, range_deg: [-10, 10]}
+    translation:   {p: 0.5, max_fraction: 0.05}
+    isotropic_scale: {p: 0.5, range: [0.90, 1.10]}
+    intensity_scale: {p: 0.5, range: [0.90, 1.10]}
+    intensity_shift: {p: 0.5, range: [-0.05, 0.05]}
+    gaussian_noise: {p: 0.3, sigma_uniform: [0.0, 0.02]}
+    clip_after: [0.0, 1.0]
+
+# ---------------------------------------------------------------------------
+# Detection objective (Section 3.5, Appendix E)
+# ---------------------------------------------------------------------------
+detection:
+  classification_loss: BCE      # dataset-specific label space
+  box_loss: CIoU
+  lambda_cls: 1.0
+  lambda_box: 1.0
+  aggregation: sample-weighted-mean   # over dataset-specific subsets
+
+# ---------------------------------------------------------------------------
+# Optimisation (Section 4.3, Table 5)
+# ---------------------------------------------------------------------------
+train:
+  optimizer: AdamW
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  scheduler: cosine-annealing
+  epochs: 300
+  batch_size: 16
+  amp: true
+  precision: bf16               # A100 / RTX 4090; use fp16 on older GPUs
+  gamma_sr: 1.0                 # Eq. (6): all three coefficients set to 1.0
+  gamma_cmcl: 1.0
+  gamma_det: 1.0
+  mixed_modal_batches: true     # CT + MRI + X-ray jointly sampled
+  val_every: 1
+  checkpoint_selection: best-validation-mAP@0.5
+  num_workers: 8
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+eval:
+  metric: mAP@0.5
+  iou_thresholds: [0.5]
+  nms_iou: 0.6
+  max_det: 300

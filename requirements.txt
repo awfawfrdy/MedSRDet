@@ -1,0 +1,45 @@
+# MedSRDet — anonymous reviewer repository
+#
+# Reference environment as reported in the manuscript (Table 5):
+#   OS                     : Ubuntu 20.04 LTS
+#   Python                 : 3.8.12
+#   PyTorch                : 2.2.0
+#   CUDA / cuDNN           : 11.3 / 8.2      (see NOTE below)
+#   CPU                    : 16 vCPU Intel Xeon Gold 6430
+#   GPU                    : NVIDIA RTX 4090 (24 GB) and 8x A100-SXM4-80GB
+#
+# NOTE on CUDA: PyTorch 2.2.0 ships official wheels for CUDA 11.8 and 12.1;
+# the CUDA 11.3 runtime reported in Table 5 is the driver/runtime level of the
+# A100 cluster node, and the 11.8 wheels are binary-compatible with it.  If you
+# pin a different CUDA build, install torch/torchvision from the matching index:
+#   pip install torch==2.2.0 torchvision==0.17.0 --index-url \
+#       https://download.pytorch.org/whl/cu118
+
+# ---- core deep-learning stack -------------------------------------------
+torch==2.2.0
+torchvision==0.17.0
+
+# ---- detection backbone --------------------------------------------------
+# YOLOv12n (shared feature encoder, Appendix B).  YOLOv12 support requires
+# ultralytics >= 8.3.
+ultralytics>=8.3.0
+
+# ---- numerical / image utilities ----------------------------------------
+numpy<2.0
+opencv-python
+Pillow
+scipy
+scikit-image
+pandas
+PyYAML
+tqdm
+matplotlib
+
+# ---- medical imaging I/O -------------------------------------------------
+# BraTS2021 / LUNA16 volumetric data and VinDr-CXR radiographs
+SimpleITK
+nibabel
+pydicom
+
+# ---- detection metrics ---------------------------------------------------
+pycocotools
