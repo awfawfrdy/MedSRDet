@@ -438,7 +438,9 @@ def prepare_luna16(raw: Path, out: Path, split_seed: int,
     """
     import SimpleITK as sitk
 
-    scans = sorted(raw.glob("*.mhd"))
+    # LUNA16 ships each subset nested as subsetN/subsetN/*.mhd, so a recursive
+    # glob is required to find every series under the raw root.
+    scans = sorted(raw.rglob("*.mhd"))
     if not scans:
         raise RuntimeError(f"no .mhd scans under {raw}")
 
