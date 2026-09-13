@@ -42,7 +42,8 @@ MedSRDet/
 │   ├── inference.py         # deployment pathway
 │   ├── selfcheck.py         # configuration checks
 │   ├── smoke_test.py        # synthetic-data pipeline check
-│   └── gen_luna16_manifest.py # LUNA16 patient-level split manifest
+│   ├── gen_luna16_manifest.py # LUNA16 patient-level split manifest
+│   └── gen_vindr_manifest.py  # VinDr-CXR fixed 7:1:2 split generator
 ├── configs/
 │   └── default.yaml         # experiment configuration
 ├── data/splits/brats2021/   # patient-level split manifest
@@ -117,8 +118,14 @@ documented in `seriesuid_to_patient.csv`, and
 `scripts/gen_luna16_manifest.py` regenerates it from the official
 `candidates_V2.csv` under split seed 42.
 
-The VinDr-CXR split manifest is **not** shipped: the dataset requires
-credentialed PhysioNet access and is not redistributed in this repository.
+The VinDr-CXR manifest is not redistributed in this repository — the dataset
+requires credentialed PhysioNet access
+(https://physionet.org/content/vindr-cxr/1.0.0/) — but it is fully
+reproducible: `scripts/gen_vindr_manifest.py` derives the same fixed 7:1:2
+partition under the independent split seed 42 directly from the official
+release.  VinDr-CXR publishes only anonymised image IDs, so its partition is
+defined over image IDs; BraTS2021 and LUNA16 are partitioned at the patient
+level.
 
 ---
 
