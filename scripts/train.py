@@ -1,27 +1,46 @@
 """MedSRDet joint training (Section 4.3, Appendix E).
 
-The完整 objective optimised within every iteration (Eq. 5/6)::
+The complete objective optimised within every iteration (Eq. 5/6)::
 
     L_total = gamma_sr * L_SR + gamma_cmcl * L_CMCL + gamma_det * L_Det
 
-with gamma_sr = gamma_cmcl = gamma_det = 1.0 in the primary experiments.
+with gamma_sr = gamma_cmcl = gamma_det = 1.0 in the primary experiments and::
+
+    L_Det = lambda_cls * L_cls + lambda_box * L_box,   lambda_cls = lambda_box = 1.0
+
+The gamma coefficients are applied OUTSIDE the detection loss; they are never
+folded into lambda_cls / lambda_box.
 
 Design points that follow the manuscript
 ----------------------------------------
-* Mixed-modal mini-batches: every batch jointly samples lesion instances from
-  BraTS2021 (MRI), LUNA16 (CT) and VinDr-CXR (X-ray) so the shared encoder is
-  exposed to heterogeneous imaging domains (Section 3.3).  Samples are NEVER
-  paired as cross-modal positives.
-* Dataset-specific label spaces: classification is evaluated only inside the
-  label space of the source dataset; regression uses the common four-parameter
-  form.  Per-dataset detection losses are aggregated with a sample-weighted
-  mean (Eq. 4, Appendix E).
+* Mixed-modal mini-batches of EXACTLY ``batch_size`` samples: every batch
+  jointly samples BraTS2021 (MRI), LUNA16 (CT) and VinDr-CXR (X-ray); the
+  extra sample when ``batch_size`` is not divisible by three rotates across
+  datasets (5+5+6 / 6+5+5 / 5+6+5) (Section 3.3).
+* CMCL participates in the joint objective: for EVERY annotated lesion
+  instance the Appendix C pipeline (``scripts/lesion_views.py``) builds an
+  augmented view and an MFASR-enhanced view from the same lesion-centred
+  support; the InfoNCE loss is non-zero in the training logs and regularises
+  the shared encoder.  Key branch = full momentum encoder pathway of Table 3:
+  ``k = g_phi_m(E_theta_m(x_sr))``, no gradients, EMA update (m = 0.999) after
+  every optimiser step, FIFO memory queue K = 65,536.
+* Dataset-specific label spaces: mixed-modal batches keep the source dataset
+  of every sample after collation.  The shared encoder and the MedHead feature
+  processing are shared; classification is routed to the per-dataset head
+  (BraTS/LUNA: 1 channel, VinDr: 14 channels) and per-dataset losses are
+  aggregated with a sample-weighted mean (Eq. 4, Appendix E).  No unified
+  cross-modal disease taxonomy exists.
+* Ground-truth class ids: VinDr-CXR keeps its native 14-class labels
+  (``scripts/preprocess.py``); classification targets are one-hot in the
+  dataset's own label space — 14 channels are never averaged into one.
+* Negative sampling (Appendix D.4): 1:1 positive:negative re-randomised per
+  epoch applies ONLY to BraTS2021 / LUNA16 *training* slices; validation and
+  test keep every eligible slice; VinDr-CXR keeps its image-level annotations
+  as-is.
 * CMCL is training-time only: the projection head, momentum encoder and memory
   queue are absent from the inference graph.
 * Optimisation: AdamW, lr 1e-4, weight decay 1e-2, cosine annealing,
   300 epochs, batch size 16, AMP enabled (Table 5).
-* Negative-slice re-sampling at a 1:1 positive:negative ratio for BraTS2021
-  and LUNA16 is re-randomised every epoch (Appendix D.4).
 * Checkpoint selection: highest validation mAP@0.5; the test set is never used
   for selection or tuning.
 
@@ -46,12 +65,16 @@ import yaml
 from torch.utils.data import DataLoader, Dataset
 
 from modules import CMCL, MFASRLoss, MFASRNet, MedHead
+from modules.detection_utils import compute_map50, decode_level_boxes
+from modules.yolo_encoder import YOLOv12FeatureEncoder
+from scripts.lesion_views import build_cmcl_views
 
 
 # --------------------------------------------------------------------------- #
 # Reproducibility (Section 4.1: five seeds, fixed split)
 # --------------------------------------------------------------------------- #
 VALID_SEEDS = {42, 43, 44, 45, 46}
+NEGATIVE_SAMPLING_DATASETS = {"brats2021", "luna16"}
 
 
 def seed_everything(seed: int) -> None:
@@ -67,17 +90,33 @@ def seed_everything(seed: int) -> None:
 class SliceDataset(Dataset):
     """One prepared dataset (HR 640 / LR 160 / YOLO labels).
 
-    Positive and negative slices are kept separately so that the training-time
-    1:1 re-sampling required by Appendix D.4 can be applied per epoch.
+    Manuscript negative-sampling protocol (Appendix D.4) is encoded by
+    ``balance_negatives``:
+
+    * BraTS2021 / LUNA16 + ``split == "train"``  -> 1:1 positive:negative
+      re-randomised every epoch;
+    * validation / test of those datasets        -> keep every eligible slice;
+    * VinDr-CXR                                  -> keep all image-level
+      annotations (no 1:1 slice balancing).
+
+    ``balance_negatives=None`` (default) selects the protocol automatically
+    from ``dataset_name`` and ``split``; an explicit value overrides it.
     """
 
-    def __init__(self, root: Path, split: str, hr_size: int = 640,
-                 lr_size: int = 160, seed: int = 42):
+    def __init__(self, root: Path, split: str, dataset_name: str = "",
+                 hr_size: int = 640, lr_size: int = 160, seed: int = 42,
+                 balance_negatives: bool | None = None):
         self.root = Path(root)
+        self.split = split
+        self.dataset_name = dataset_name or self.root.name
         self.hr_size = hr_size
         self.lr_size = lr_size
         self.seed = seed
         self.epoch = 0
+        if balance_negatives is None:
+            balance_negatives = (self.dataset_name in NEGATIVE_SAMPLING_DATASETS
+                                 and split == "train")
+        self.balance_negatives = bool(balance_negatives)
 
         patient_file = self.root / "splits" / f"{split}_patients.txt"
         if not patient_file.exists():
@@ -108,23 +147,32 @@ class SliceDataset(Dataset):
         return pos, neg
 
     def set_epoch(self, epoch: int) -> None:
-        """Re-randomise the negative slice pool (Appendix D.4)."""
+        """Re-randomise the negative slice pool (Appendix D.4, train only)."""
         self.epoch = epoch
         rng = random.Random(self.seed + epoch)
         rng.shuffle(self.negatives)
 
     def __len__(self) -> int:
-        # 1:1 positive:negative balance on the training side.
-        return len(self.positives) + min(len(self.negatives), len(self.positives))
+        if self.balance_negatives:
+            # 1:1 positive:negative balance, training side only.
+            return len(self.positives) + min(len(self.negatives), len(self.positives))
+        # Validation / test (and VinDr-CXR): keep every eligible slice.
+        return len(self.positives) + len(self.negatives)
 
     def __getitem__(self, idx: int):
         import cv2
 
-        if idx < len(self.positives):
-            lr_p, hr_p, lbl_p = self.positives[idx]
+        if self.balance_negatives:
+            if idx < len(self.positives):
+                lr_p, hr_p, lbl_p = self.positives[idx]
+            else:
+                j = idx - len(self.positives)
+                lr_p, hr_p, lbl_p = self.negatives[j % len(self.negatives)]
         else:
-            j = idx - len(self.positives)
-            lr_p, hr_p, lbl_p = self.negatives[j % len(self.negatives)]
+            if idx < len(self.positives):
+                lr_p, hr_p, lbl_p = self.positives[idx]
+            else:
+                lr_p, hr_p, lbl_p = self.negatives[idx - len(self.positives)]
 
         lr = cv2.imread(str(lr_p), cv2.IMREAD_UNCHANGED).astype(np.float32) / 255.0
         hr = cv2.imread(str(hr_p), cv2.IMREAD_UNCHANGED).astype(np.float32) / 255.0
@@ -134,78 +182,117 @@ class SliceDataset(Dataset):
         if hr.ndim == 2:
             hr = np.repeat(hr[:, :, None], 3, axis=2)
 
-        boxes = []
+        boxes, class_ids = [], []
         text = Path(lbl_p).read_text().strip()
         for line in text.splitlines():
             p = line.split()
             if len(p) == 5:
+                class_ids.append(int(p[0]))          # native dataset class id
                 boxes.append([float(v) for v in p[1:]])
 
         return {
             "lr": torch.from_numpy(np.ascontiguousarray(lr)).permute(2, 0, 1).float(),
             "hr": torch.from_numpy(np.ascontiguousarray(hr)).permute(2, 0, 1).float(),
             "boxes": torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4),
+            "classes": torch.as_tensor(class_ids, dtype=torch.long),
+            "dataset": self.dataset_name,
         }
 
 
 def collate(samples):
+    """Collate that preserves dataset identity and class ids."""
     lr = torch.stack([s["lr"] for s in samples])
     hr = torch.stack([s["hr"] for s in samples])
-    boxes, batch_idx = [], []
+    boxes, classes, batch_idx = [], [], []
     for i, s in enumerate(samples):
-        for b in s["boxes"]:
+        for bi, b in enumerate(s["boxes"]):
             boxes.append(b)
+            classes.append(int(s["classes"][bi]))
             batch_idx.append(i)
     if boxes:
         boxes = torch.stack(boxes)
+        classes = torch.as_tensor(classes, dtype=torch.long)
         batch_idx = torch.as_tensor(batch_idx, dtype=torch.long)
     else:
         boxes = torch.zeros((0, 4), dtype=torch.float32)
+        classes = torch.zeros((0,), dtype=torch.long)
         batch_idx = torch.zeros((0,), dtype=torch.long)
-    return {"lr": lr, "hr": hr, "boxes": boxes, "batch_idx": batch_idx}
+    return {
+        "lr": lr, "hr": hr, "boxes": boxes, "classes": classes,
+        "batch_idx": batch_idx,
+        "source_dataset": [s["dataset"] for s in samples],
+    }
 
 
 class MixedModalBatchSampler(torch.utils.data.Sampler):
-    """Build mini-batches that jointly sample all datasets (Section 3.3)."""
+    """Mini-batches of EXACTLY ``batch_size`` samples covering all datasets.
+
+    With three datasets and batch 16 the quotas are 5+5+6; the extra sample
+    rotates across datasets batch by batch (5+5+6, 6+5+5, 5+6+5, ...) so no
+    dataset is systematically favoured.  ``len(batch) == batch_size`` holds
+    for every batch.
+    """
 
     def __init__(self, datasets: list, batch_size: int, seed: int = 42):
         self.datasets = datasets
         self.batch_size = batch_size
         self.seed = seed
         self.epoch = 0
+        if batch_size < len(datasets):
+            raise ValueError("batch_size must be >= number of datasets")
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
 
-    def __iter__(self):
-        rng = random.Random(self.seed + self.epoch)
-        # Round-robin over datasets so every batch sees heterogeneous domains.
-        per_ds = max(1, self.batch_size // max(len(self.datasets), 1))
-        batches = []
-        n = min(len(d) for d in self.datasets)
-        n_batches = max(1, (n * len(self.datasets)) // self.batch_size)
+    def _quotas(self, batch_no: int) -> list:
+        k = len(self.datasets)
+        base = self.batch_size // k
+        extra = self.batch_size - base * k
+        quotas = [base] * k
+        for e in range(extra):
+            quotas[(batch_no + e) % k] += 1
+        return quotas
 
-        for _ in range(n_batches):
+    def __iter__(self):
+        rng = random.Random(self.seed * 1000 + self.epoch)
+        base = self.batch_size // len(self.datasets)
+        # Every dataset can receive the rotating extra sample, so each needs
+        # at least (base + 1) items for a batch to always be full-size.
+        n_batches = min(len(d) for d in self.datasets) // (base + 1)
+        n_batches = max(n_batches, 1)
+
+        batches = []
+        for b in range(n_batches):
+            quotas = self._quotas(b)
             batch = []
-            for d in self.datasets:
-                idx = [rng.randrange(len(d)) for _ in range(per_ds)]
-                batch.extend([(self.datasets.index(d), i) for i in idx])
+            for di, quota in enumerate(quotas):
+                idx = [rng.randrange(len(self.datasets[di])) for _ in range(quota)]
+                batch.extend([(di, i) for i in idx])
             rng.shuffle(batch)
-            batches.append(batch[:self.batch_size])
+            assert len(batch) == self.batch_size, (
+                f"mixed-modal batch must contain exactly {self.batch_size} "
+                f"samples, got {len(batch)}"
+            )
+            batches.append(batch)
         return iter(batches)
 
     def __len__(self):
-        n = min(len(d) for d in self.datasets)
-        return max(1, (n * len(self.datasets)) // self.batch_size)
+        base = self.batch_size // len(self.datasets)
+        return max(1, min(len(d) for d in self.datasets) // (base + 1))
 
 
 # --------------------------------------------------------------------------- #
 # Model
 # --------------------------------------------------------------------------- #
 class MedSRDet(nn.Module):
-    """MFASR + shared YOLOv12n encoder + MedHead + CMCL (training-time)."""
+    """MFASR + shared YOLOv12n encoder + MedHead + CMCL (training-time).
 
-    def __init__(self, cfg: dict, dataset_nc: dict):
+    ``encoder`` allows injecting a pre-built feature encoder (used by the
+    smoke tests); by default the shared YOLOv12n encoder is constructed from
+    the ultralytics checkpoint given in the config.
+    """
+
+    def __init__(self, cfg: dict, dataset_nc: dict, encoder=None):
         super().__init__()
 
         m = cfg["model"]
@@ -218,11 +305,15 @@ class MedSRDet(nn.Module):
             scale=m["mfasr"]["scale"],
         )
 
-        from ultralytics import YOLO
+        if encoder is None:
+            from ultralytics import YOLO
 
-        yolo = YOLO(m["backbone_weight"])
-        self.detector = yolo.model
-        self.encoder_channels = self._probe_encoder_channels()
+            detector = YOLO(m["backbone_weight"]).model
+            self.shared_encoder = YOLOv12FeatureEncoder(detector)
+        else:
+            self.shared_encoder = encoder
+
+        self.encoder_channels = list(self.shared_encoder.channels)
 
         self.medhead = MedHead(
             in_channels=self.encoder_channels,      # P3, P4, P5
@@ -242,28 +333,9 @@ class MedSRDet(nn.Module):
             queue_size=m["cmcl"]["queue_size"],
         )
 
-    def _probe_encoder_channels(self):
-        """Channel widths of P3/P4/P5 for the active YOLOv12n build.
-
-        ultralytics exposes the FPN widths through the Detect head; the values
-        below are the YOLOv12n defaults and are verified at first forward.
-        """
-        for mod in self.detector.modules():
-            if mod.__class__.__name__ == "Detect":
-                try:
-                    return [int(c) for c in mod.cv2[0][0].in_channels][:3]
-                except Exception:
-                    pass
-        return [256, 256, 256]
-
     def encode(self, x):
         """Return the P3/P4/P5 feature maps of the shared encoder."""
-        feats = []
-        for i, layer in enumerate(self.detector.model):
-            x = layer(x)
-            feats.append(x)
-        # The YOLO FPN emits P3/P4/P5 immediately before the Detect head.
-        return feats[-4:-1]
+        return self.shared_encoder(x)
 
     def forward(self, lr, dataset: str = "brats2021"):
         """Inference pathway: MFASR -> encoder -> MedHead (CMCL excluded)."""
@@ -271,29 +343,59 @@ class MedSRDet(nn.Module):
         p345 = self.encode(sr)
         return self.medhead(p345, dataset=dataset)
 
-    def forward_losses(self, lr, hr, boxes, batch_idx, sr_criterion,
+    # ------------------------------------------------------------------ #
+    def forward_losses(self, lr, hr, boxes, classes, batch_idx,
+                       source_datasets, sr_criterion,
                        gamma_sr, gamma_cmcl, gamma_det, cmcl_views=None):
+        """Joint objective of Eq. (5)/(6) for one mixed-modal mini-batch."""
         sr = self.mfasr(lr)
-
         loss_sr, sr_items = sr_criterion(sr, hr)
 
         p345 = self.encode(sr)
-        det_out = self.medhead(p345)
+        feats = self.medhead.feature_refine(p345)     # shared feature processing
 
-        loss_det = detection_loss(
-            det_out, boxes, batch_idx,
-            lambda_cls=gamma_det * self._lambda_cls,
-            lambda_box=gamma_det * self._lambda_box,
-        )
+        # ---- dataset-specific detection losses, sample-weighted mean (Eq. 4)
+        B = lr.shape[0]
+        unique_ds = list(dict.fromkeys(source_datasets))
+        loss_det = lr.new_zeros(())
+        for d in unique_ds:
+            sel_samples = [i for i, name in enumerate(source_datasets)
+                           if name == d]
+            idx = torch.as_tensor(sel_samples, device=lr.device)
+            feats_d = [f.index_select(0, idx) for f in feats]
 
+            mask = torch.zeros(boxes.shape[0], dtype=torch.bool,
+                               device=boxes.device)
+            remap = {}
+            for local_b, glob_b in enumerate(sel_samples):
+                mask |= batch_idx == glob_b
+                remap[glob_b] = local_b
+            boxes_d = boxes[mask]
+            classes_d = classes[mask]
+            batch_d = torch.as_tensor(
+                [remap[int(v)] for v in batch_idx[mask].tolist()],
+                device=boxes.device, dtype=torch.long)
+
+            cls_d = self.medhead.classify(feats_d, d)     # per-dataset head
+            box_d = self.medhead.regress(feats_d)         # shared regression
+            l_d = detection_loss(cls_d, box_d, boxes_d, classes_d, batch_d,
+                                 hr_size=sr.shape[-1])    # SR/HR pixel space
+            loss_det = loss_det + (len(sel_samples) / B) * l_d
+
+        # ---- CMCL on the Appendix-C lesion views (Table 3 momentum pathway)
         if cmcl_views is not None:
-            aug_feat = self.encode(cmcl_views["augmented"])
-            sr_feat = self.encode(cmcl_views["mfasr_enhanced"])
-            loss_cmcl = self.cmcl(aug_feat, sr_feat)
+            with torch.no_grad():
+                # Key view: MFASR-enhanced; produced by the current MFASR and
+                # encoded by the frozen momentum encoder (no gradients on the
+                # key branch, Table 3).
+                key_imgs = self.mfasr(cmcl_views["low_res"])
+            loss_cmcl = self.cmcl.forward_from_images(
+                cmcl_views["augmented"], key_imgs, self.shared_encoder)
         else:
             loss_cmcl = torch.zeros((), device=sr.device)
 
-        loss_total = gamma_sr * loss_sr + gamma_cmcl * loss_cmcl + loss_det
+        loss_total = (gamma_sr * loss_sr + gamma_cmcl * loss_cmcl
+                      + gamma_det * loss_det)
 
         return {
             "loss_total": loss_total,
@@ -304,65 +406,44 @@ class MedSRDet(nn.Module):
             "sr": sr,
         }
 
-    _lambda_cls = 1.0
-    _lambda_box = 1.0
 
+def detection_loss(cls_levels, box_levels, boxes, classes, batch_idx,
+                   hr_size: int = 640, lambda_cls: float = 1.0,
+                   lambda_box: float = 1.0):
+    """L_Det = lambda_cls * L_cls + lambda_box * L_box (Appendix E).
 
-def _decode_boxes(box_lvl, stride, grid):
-    """Anchor-free decoding of MedHead's (dx, dy, dw, dh) to xyxy pixels.
+    Classification: BCE over every grid cell and every channel of the
+    dataset's OWN label space.  The target tensor has shape [B, C, H, W]; each
+    ground-truth object sets the positive target in the channel of its native
+    ``class_id`` — 14-class label spaces are never averaged into one channel.
 
-    The manuscript fixes the regression *target* as the four-parameter
-    representation (dx, dy, dw, dh) (Appendix E) but does not pin down the
-    decoding rule; the standard anchor-free parameterisation below is used and
-    is stated explicitly for reproducibility.
-    """
-    dx, dy, dw, dh = box_lvl[:, 0], box_lvl[:, 1], box_lvl[:, 2], box_lvl[:, 3]
-    bx = (torch.sigmoid(dx) * 2.0 - 0.5 + grid[..., 0]) * stride
-    by = (torch.sigmoid(dy) * 2.0 - 0.5 + grid[..., 1]) * stride
-    bw = (torch.sigmoid(dw) * 2.0) ** 2 * stride
-    bh = (torch.sigmoid(dh) * 2.0) ** 2 * stride
-    return torch.stack([bx - bw / 2, by - bh / 2, bx + bw / 2, by + bh / 2],
-                       dim=-1)                                   # [B,H,W,4]
+    Regression: CIoU on the assigned cells only, decoded with the SAME anchor-
+    free parameterisation as evaluation/inference
+    (``modules.detection_utils.decode_level_boxes``).
 
-
-def detection_loss(det_out, boxes, batch_idx, hr_size=640,
-                   lambda_cls=1.0, lambda_box=1.0):
-    """BCE classification + CIoU regression, sample-weighted mean (Eq. 3/4).
-
-    Targets are assigned to the grid cell nearest to each ground-truth box
-    centre (anchor-free, single positive per object).  Classification uses
-    binary cross-entropy in the dataset-specific label space and regression
-    uses complete IoU, as stated in Appendix E (Table E.1).
-
-    Per-dataset losses are averaged over all samples of the mini-batch, which
-    yields the sample-weighted mean of Eq. (4).
+    Per-dataset losses are averaged over the samples of the dataset subset;
+    the caller aggregates the subsets with a sample-weighted mean (Eq. 4).
     """
     from ultralytics.utils.metrics import bbox_iou
 
-    device = det_out["cls"][0].device
+    device = cls_levels[0].device
     cls_terms, box_terms = [], []
 
-    for cls_lvl, box_lvl in zip(det_out["cls"], det_out["bbox"]):
-        B, _, H, W = cls_lvl.shape
+    gt_xyxy = boxes.new_zeros((boxes.shape[0], 4))
+    if boxes.numel():
+        cx, cy, bw, bh = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        gt_xyxy = torch.stack([
+            (cx - bw / 2) * hr_size, (cy - bh / 2) * hr_size,
+            (cx + bw / 2) * hr_size, (cy + bh / 2) * hr_size,
+        ], dim=1)
+
+    for cls_lvl, box_lvl in zip(cls_levels, box_levels):
+        B, C, H, W = cls_lvl.shape
         stride = hr_size / H
 
-        gy, gx = torch.meshgrid(
-            torch.arange(H, device=device), torch.arange(W, device=device),
-            indexing="ij",
-        )
-        grid = torch.stack([gx, gy], dim=-1).float()             # [H,W,2]
-
-        cls_target = torch.zeros((B, H, W), device=device)
+        cls_target = torch.zeros((B, C, H, W), device=device)
         box_target = torch.zeros((B, H, W, 4), device=device)
         assigned = torch.zeros((B, H, W), device=device, dtype=torch.bool)
-
-        gt_xyxy = boxes.new_zeros((boxes.shape[0], 4))
-        if boxes.numel():
-            cx, cy, bw, bh = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-            gt_xyxy = torch.stack([
-                (cx - bw / 2) * hr_size, (cy - bh / 2) * hr_size,
-                (cx + bw / 2) * hr_size, (cy + bh / 2) * hr_size,
-            ], dim=1)
 
         for b in range(B):
             sel = (batch_idx == b).nonzero(as_tuple=True)[0]
@@ -373,20 +454,20 @@ def detection_loss(det_out, boxes, batch_idx, hr_size=640,
             cy_px = (gt[:, 1] + gt[:, 3]) / 2.0
             gi = (cx_px / stride).long().clamp(0, W - 1)
             gj = (cy_px / stride).long().clamp(0, H - 1)
-            cls_target[b, gj, gi] = 1.0
+            cid = classes[sel].clamp(0, C - 1).long()
+            cls_target[b, cid, gj, gi] = 1.0
             box_target[b, gj, gi] = gt
             assigned[b, gj, gi] = True
 
-        # ---- classification: BCE over every grid cell ----
-        logits = cls_lvl[:, 0] if cls_lvl.shape[1] == 1 else cls_lvl.mean(dim=1)
+        # ---- classification: BCE in the dataset-specific label space ----
         cls_terms.append(
             torch.nn.functional.binary_cross_entropy_with_logits(
-                logits.float(), cls_target.float()
+                cls_lvl.float(), cls_target.float()
             )
         )
 
         # ---- regression: CIoU on the assigned cells only ----
-        pred_xyxy = _decode_boxes(box_lvl.permute(0, 2, 3, 1), stride, grid)
+        pred_xyxy = decode_level_boxes(box_lvl, stride)      # [B,H,W,4]
         if assigned.any():
             p = pred_xyxy[assigned]
             t = box_target[assigned]
@@ -431,23 +512,24 @@ def main() -> int:
         indent=2))
 
     root = Path(args.data_root)
-    dataset_nc = {d: cfg["datasets"][d]["num_classes"]
-                  for d in ("brats2021", "luna16", "vindrcxr")}
+    dataset_names = ["brats2021", "luna16", "vindrcxr"]
+    dataset_nc = {d: cfg["datasets"][d]["num_classes"] for d in dataset_names}
 
-    train_sets = [SliceDataset(root / d, "train",
-                               hr_size=cfg["common"]["hr_size"],
-                               lr_size=cfg["common"]["lr_size"],
-                               seed=args.seed)
-                  for d in dataset_nc]
-    val_sets = [SliceDataset(root / d, "val",
-                             hr_size=cfg["common"]["hr_size"],
-                             lr_size=cfg["common"]["lr_size"],
-                             seed=args.seed)
-                for d in dataset_nc]
+    common = dict(hr_size=cfg["common"]["hr_size"],
+                  lr_size=cfg["common"]["lr_size"], seed=args.seed)
+    train_sets = [SliceDataset(root / d, "train", dataset_name=d, **common)
+                  for d in dataset_names]
+    # Validation keeps every eligible slice and its dataset identity.
+    val_sets = [(d, SliceDataset(root / d, "val", dataset_name=d, **common))
+                for d in dataset_names]
 
     sampler = MixedModalBatchSampler(train_sets, batch_size, seed=args.seed)
 
     model = MedSRDet(cfg, dataset_nc).to(args.device)
+
+    # Table 3 momentum encoder E_theta_m: attach BEFORE the optimiser is
+    # built; the copy is frozen (requires_grad=False) and updated by EMA.
+    model.cmcl.attach_momentum_backbone(model.shared_encoder)
 
     sr_criterion = MFASRLoss(
         lambda_pix=cfg["model"]["sr_loss"]["lambda_pix"],
@@ -461,7 +543,8 @@ def main() -> int:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     amp_dtype = torch.bfloat16 if t["precision"] == "bf16" else torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=(t["amp"] and amp_dtype is torch.float16))
+    amp_on = bool(t["amp"]) and torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler(enabled=(amp_on and amp_dtype is torch.float16))
 
     best_map = -1.0
     log = open(out / "metrics.csv", "w")
@@ -480,22 +563,40 @@ def main() -> int:
             # Materialise the mixed-modal batch from its (dataset, index) pairs.
             samples = [train_sets[di][ii] for di, ii in batch]
             data = collate(samples)
+
             lr = data["lr"].to(args.device)
             hr = data["hr"].to(args.device)
+            boxes = data["boxes"].to(args.device)
+            classes = data["classes"].to(args.device)
+            batch_idx = data["batch_idx"].to(args.device)
+
+            # Appendix C: one positive pair per annotated lesion instance.
+            cmcl_views = None
+            if boxes.shape[0] > 0:
+                aug_v, low_v = build_cmcl_views(
+                    hr, data["boxes"], data["classes"], data["batch_idx"],
+                    seed=args.seed, epoch=epoch,
+                )
+                cmcl_views = {"augmented": aug_v, "low_res": low_v}
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=amp_dtype,
-                                enabled=t["amp"]):
+                                enabled=amp_on):
                 out_d = model.forward_losses(
-                    lr, hr, data["boxes"].to(args.device),
-                    data["batch_idx"].to(args.device), sr_criterion,
+                    lr, hr, boxes, classes, batch_idx,
+                    data["source_dataset"], sr_criterion,
                     t["gamma_sr"], t["gamma_cmcl"], t["gamma_det"],
+                    cmcl_views=cmcl_views,
                 )
                 loss = out_d["loss_total"]
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+
+            # Table 3: EMA update of E_theta_m / g_phi_m AFTER the optimiser
+            # step:  theta_m <- m * theta_m + (1 - m) * theta.
+            model.cmcl.update_momentum_encoder(model.shared_encoder)
 
             tot += float(loss.detach())
             sr_t += float(out_d["loss_sr"].detach())
@@ -507,7 +608,8 @@ def main() -> int:
 
         map50 = float("nan")
         if epoch % t.get("val_every", 1) == 0:
-            map50 = evaluate_map(model, val_sets, args.device, batch_size)
+            map50 = evaluate_map(model, val_sets, args.device, batch_size,
+                                 hr_size=cfg["common"]["hr_size"])
 
         lr_now = optimizer.param_groups[0]["lr"]
         log.write(f"{epoch},{tot/max(n_batches,1):.6f},{sr_t/max(n_batches,1):.6f},"
@@ -530,19 +632,21 @@ def main() -> int:
 def evaluate_map(model, val_sets, device, batch_size, hr_size: int = 640):
     """Validation mAP@0.5, used for checkpoint selection only.
 
-    The held-out test set is evaluated once, after the checkpoint has been
-    selected (Section 4.3).  CMCL is inactive in eval mode.
+    ``val_sets`` is a list of ``(dataset_name, dataset)`` pairs so every
+    validation pass is routed to the correct dataset-specific classification
+    head.  The held-out test set is evaluated once, after checkpoint selection
+    (Section 4.3).  CMCL is inactive in eval mode.
     """
-    # Imported lazily: scripts.evaluate imports `collate` from this module.
-    from scripts.evaluate import compute_map50, run
+    from scripts.evaluate import run
 
     model.eval()
     aps = []
     with torch.no_grad():
-        for ds in val_sets:
+        for dataset_name, ds in val_sets:
             loader = DataLoader(ds, batch_size=batch_size, collate_fn=collate,
                                 shuffle=False)
-            predictions, targets = run(model, loader, device, hr_size=hr_size)
+            predictions, targets = run(model, loader, device,
+                                       dataset=dataset_name, hr_size=hr_size)
             map50, _, _ = compute_map50(predictions, targets)
             if not math.isnan(map50):
                 aps.append(map50)

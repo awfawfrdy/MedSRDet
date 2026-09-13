@@ -10,6 +10,13 @@ from .rrdbnet_arch import RRDB, RRDBNet, ResidualDenseBlock
 from .loss_mfasr import MFASRLoss, FrequencyLoss, VGGPerceptualLoss
 from .cmcl import CMCL
 from .medhead import MedHead, ScaleAwareAttention, SpatialAwareAttention, TaskAwareAttention
+from .yolo_encoder import YOLOv12FeatureEncoder
+from .detection_utils import (
+    decode_level_boxes,
+    decode_medhead_outputs,
+    postprocess_detections,
+    compute_map50,
+)
 
 __all__ = [
     "MFASRNet",
@@ -24,4 +31,9 @@ __all__ = [
     "ScaleAwareAttention",
     "SpatialAwareAttention",
     "TaskAwareAttention",
+    "YOLOv12FeatureEncoder",
+    "decode_level_boxes",
+    "decode_medhead_outputs",
+    "postprocess_detections",
+    "compute_map50",
 ]

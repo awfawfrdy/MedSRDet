@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Model weights and training outputs (not redistributed)
+*.pt
+runs/
