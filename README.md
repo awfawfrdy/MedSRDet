@@ -41,10 +41,12 @@ MedSRDet/
 │   ├── evaluate.py          # mAP@0.5 evaluation
 │   ├── inference.py         # deployment pathway
 │   ├── selfcheck.py         # configuration checks
-│   └── smoke_test.py        # synthetic-data pipeline check
+│   ├── smoke_test.py        # synthetic-data pipeline check
+│   └── gen_luna16_manifest.py # LUNA16 patient-level split manifest
 ├── configs/
 │   └── default.yaml         # experiment configuration
 ├── data/splits/brats2021/   # patient-level split manifest
+data/splits/luna16/      # patient-level split manifest (SeriesInstanceUIDs)
 ├── requirements.txt
 ├── LICENSE
 └── LICENSE_BasicSR.txt      # Apache-2.0, covers the BasicSR-derived code
@@ -104,6 +106,19 @@ five optimisation seeds 42–46, which vary stochastic optimisation only —
 read the same persisted manifest.  The BraTS2021 manifest shipped in
 `data/splits/brats2021/` is 876 / 125 / 250 patients (70 / 10 / 20 % of
 1,251).
+
+The LUNA16 manifest shipped in `data/splits/luna16/` is 622 / 89 / 177
+SeriesInstanceUIDs (621 / 89 / 177 patients; 70 / 10 / 20 % of 887).  LUNA16
+is a curated LIDC-IDRI subset in which a patient may contribute two CT
+series — LIDC-IDRI-0332 contributes two; the partition is therefore performed
+at the **PatientID** level and only expanded to SeriesInstanceUIDs when
+writing the manifest, so that no patient leaks across folds.  The grouping is
+documented in `seriesuid_to_patient.csv`, and
+`scripts/gen_luna16_manifest.py` regenerates it from the official
+`candidates_V2.csv` under split seed 42.
+
+The VinDr-CXR split manifest is **not** shipped: the dataset requires
+credentialed PhysioNet access and is not redistributed in this repository.
 
 ---
 
