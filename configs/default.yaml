@@ -22,7 +22,15 @@ common:
   mask_interpolation: nearest
   split_ratio: [0.7, 0.1, 0.2] # patient-level train / val / test
   split_level: patient
-  seeds: [42, 43, 44, 45, 46]
+  split_seed: 42               # INDEPENDENT fixed split seed: controls the
+                               # 7:1:2 partition ONLY. It is decoupled from
+                               # the optimisation seeds below — the training
+                               # seeds 42-46 NEVER change the data partition.
+                               # The split is generated once by
+                               # scripts/preprocess.py and persisted as
+                               # splits/{train,val,test}_patients.txt; every
+                               # repeated run reads the same manifest.
+  seeds: [42, 43, 44, 45, 46]  # optimisation seeds only (Section 4.1)
 
 # ---------------------------------------------------------------------------
 # Dataset-specific preprocessing and 2D target construction

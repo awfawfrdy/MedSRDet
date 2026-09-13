@@ -343,6 +343,90 @@ def check_10_shared_decoder() -> None:
             "postprocess merges P3/P4/P5 with class-aware NMS")
 
 
+def check_11_fixed_split_manifests() -> None:
+    print("\n=== 11. fixed split: 5 training seeds -> IDENTICAL patient split ===")
+    import shutil
+    from scripts.preprocess import (SPLIT_SEED_DEFAULT, patient_split,
+                                    read_split_dir, resolve_splits)
+
+    patients = [f"patient{i:03d}" for i in range(40)]
+    tmp = Path(tempfile.mkdtemp(prefix="splits_check_"))
+    try:
+        # --- generation under the independent split seed, then persistence ---
+        out1 = tmp / "run1"
+        out1.mkdir(parents=True)
+        splits, source1 = resolve_splits(patients, None, "brats2021",
+                                         SPLIT_SEED_DEFAULT, out1)
+        splits = {k: set(v) for k, v in splits.items()}   # normalise types
+        persisted = read_split_dir(out1 / "splits")
+        _expect(persisted is not None and
+                all(persisted[s] == splits[s] for s in ("train", "val", "test")),
+                f"split generated once is persisted verbatim "
+                f"(source={source1})")
+
+        # --- the five OPTIMISATION seeds must all read the SAME manifest ---
+        same_across_seeds = True
+        for ts in (42, 43, 44, 45, 46):
+            # simulate a repeated run: same output dir, any optimisation seed;
+            # the persisted manifest wins and is returned unchanged.
+            again, src = resolve_splits(patients, None, "brats2021",
+                                        ts, out1)
+            same_across_seeds &= (again == persisted and src == "persisted")
+        _expect(same_across_seeds,
+                "training seeds 42-46 all read the IDENTICAL persisted "
+                "manifest (no re-generation)")
+
+        # --- determinism: fresh dirs + same split seed -> same partition ---
+        out2, out3 = tmp / "run2", tmp / "run3"
+        out2.mkdir(); out3.mkdir()
+        a, _ = resolve_splits(patients, None, "brats2021",
+                              SPLIT_SEED_DEFAULT, out2)
+        b, _ = resolve_splits(patients, None, "brats2021",
+                              SPLIT_SEED_DEFAULT, out3)
+        _expect(a == b, "two fresh preprocessing runs with the same split "
+                        "seed produce the same partition")
+
+        # --- the split seed controls the partition (and only it) ---
+        out4 = tmp / "run4"
+        out4.mkdir()
+        c, _ = resolve_splits(patients, None, "brats2021", 7, out4)
+        c = {k: set(v) for k, v in c.items()}                 # normalise types
+        _expect(c != persisted,
+                "a different independent split seed yields a different "
+                "partition (seed controls the split, training seeds do not)")
+
+        # --- protocol properties: disjoint + 7:1:2 ratio ---
+        tr, va, te = (persisted["train"], persisted["val"], persisted["test"])
+        n = len(patients)
+        disjoint = not ((tr & va) or (tr & te) or (va & te))
+        _expect(disjoint and len(tr | va | te) == n,
+                f"subsets are patient-disjoint and cover all {n} patients")
+        _expect(abs(len(tr) - 0.7 * n) <= 1 and abs(len(va) - 0.1 * n) <= 1
+                and abs(len(te) - 0.2 * n) <= 1,
+                f"7:1:2 ratio holds (train={len(tr)}, val={len(va)}, "
+                f"test={len(te)})")
+
+        # --- SliceDataset reads manifests only (never regenerates) ---
+        from scripts.train import SliceDataset
+        root = tmp / "ds"
+        (root / "splits").mkdir(parents=True)
+        (root / "splits" / "train_patients.txt").write_text("p1\np2\n")
+        (root / "splits" / "val_patients.txt").write_text("p1\n")
+        (root / "splits" / "test_patients.txt").write_text("p2\n")
+        (root / "manifest.csv").write_text(
+            "patient,z,positive,n_boxes,hr,lr,label\n"
+            "p1,0,0,0,h,l,t\np2,0,0,0,h,l,t\n")
+        patients_per_seed = []
+        for ts in (42, 43, 44, 45, 46):
+            ds = SliceDataset(root, "train", dataset_name="brats2021", seed=ts)
+            patients_per_seed.append(ds.patients)
+        _expect(all(p == patients_per_seed[0] for p in patients_per_seed),
+                "SliceDataset with training seeds 42-46 sees the identical "
+                "patient set (manifests are read, never regenerated)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--no-yolo", action="store_true",
@@ -355,6 +439,7 @@ def main() -> int:
     check_2_mixed_modal_batch()
     check_3_vindr_labels()
     check_8_negative_sampling()
+    check_11_fixed_split_manifests()
     check_9_dataset_routing(None)
     check_10_shared_decoder()
 

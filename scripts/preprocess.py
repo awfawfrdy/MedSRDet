@@ -26,10 +26,20 @@ Implements Section 4.2 and Appendix D (Tables D.1) of the manuscript:
                                  identical letterbox parameters.
 
 Patient-level train/val/test partitioning is performed BEFORE slice extraction
-so that no patient contributes to more than one subset.  Frozen split
-manifests (``--split-manifest-root``) take priority over re-randomised
-splits: if ``<root>/<dataset>/{train,val,test}_patients.txt`` exist they are
-used verbatim.
+so that no patient contributes to more than one subset (Section 4.1: fixed
+patient-level 7:1:2 split, retained across all repeated runs).
+
+Split control
+-------------
+The partition is controlled by an INDEPENDENT fixed split seed
+(``--split-seed``, default ``SPLIT_SEED_DEFAULT``), which is decoupled from
+the five optimisation seeds (42-46): the optimisation seed NEVER changes the
+data partition (Section 4.1).  As soon as a split is generated it is
+PERSISTED as ``splits/{train,val,test}_patients.txt``; every subsequent
+preprocessing or training run reads that same persisted manifest
+(idempotent).  An externally provided frozen manifest
+(``--split-manifest-root``, e.g. the repository ``data/splits/<dataset>/``)
+always takes precedence.
 
 Usage
 -----
@@ -168,7 +178,11 @@ def connected_component_boxes(mask: np.ndarray, connectivity: int = 8):
 
 
 def patient_split(patient_ids, ratios=(0.7, 0.1, 0.2), seed: int = 42):
-    """Patient-level 7:1:2 partition (Section 4.1)."""
+    """Patient-level 7:1:2 partition (Section 4.1).
+
+    Deterministic in ``(patient_ids, seed)``; ``seed`` here is the INDEPENDENT
+    split seed, never an optimisation seed.
+    """
     ids = sorted(patient_ids)
     rng = random.Random(seed)
     rng.shuffle(ids)
@@ -184,15 +198,18 @@ def patient_split(patient_ids, ratios=(0.7, 0.1, 0.2), seed: int = 42):
     }
 
 
-def load_split_manifest(root: Path | None, dataset: str):
-    """Load a frozen split manifest if available, else return None.
+# Independent fixed split seed (Section 4.1).  Decoupled from the five
+# optimisation seeds 42-46: the optimisation seed never changes the partition.
+SPLIT_SEED_DEFAULT = 42
 
-    Expected layout: ``<root>/<dataset>/{train,val,test}_patients.txt``.
+
+def read_split_dir(split_dir: Path):
+    """Read a persisted ``{train,val,test}_patients.txt`` manifest set.
+
+    Returns ``{split: set(ids)}`` or ``None`` if incomplete.
     """
-    if root is None:
-        return None
-    d = Path(root) / dataset
-    files = {s: d / f"{s}_patients.txt" for s in ("train", "val", "test")}
+    split_dir = Path(split_dir)
+    files = {s: split_dir / f"{s}_patients.txt" for s in ("train", "val", "test")}
     if not all(f.exists() for f in files.values()):
         return None
     return {
@@ -201,16 +218,47 @@ def load_split_manifest(root: Path | None, dataset: str):
     }
 
 
+def load_split_manifest(root: Path | None, dataset: str):
+    """Load an external frozen split manifest if available, else return None.
+
+    Expected layout: ``<root>/<dataset>/{train,val,test}_patients.txt``.
+    """
+    if root is None:
+        return None
+    return read_split_dir(Path(root) / dataset)
+
+
 def resolve_splits(patient_ids, manifest_root: Path | None, dataset: str,
-                   split_seed: int):
-    """Frozen manifest when available (P0), otherwise random 7:1:2 split."""
-    frozen = load_split_manifest(manifest_root, dataset)
-    if frozen is not None:
-        print(f"[splits] using frozen manifest {Path(manifest_root) / dataset}")
-        return frozen
-    print(f"[splits] no frozen manifest for {dataset!r}; "
-          f"generating random patient-level 7:1:2 split (seed {split_seed})")
-    return patient_split(patient_ids, seed=split_seed)
+                   split_seed: int, out: Path):
+    """Resolve the FIXED patient-level 7:1:2 split (Section 4.1).
+
+    Priority order:
+      1. a manifest already persisted under ``out/splits`` (idempotent re-runs
+         and all repeated experiments read the SAME manifest);
+      2. an external frozen manifest (``--split-manifest-root``);
+      3. otherwise generate a deterministic 7:1:2 partition from the
+         INDEPENDENT split seed and persist it immediately.
+
+    Returns ``(splits, split_source)``.
+    """
+    persisted = read_split_dir(Path(out) / "splits")
+    if persisted is not None:
+        print(f"[splits] {dataset}: reusing persisted manifest "
+              f"{Path(out) / 'splits'} (identical for every training seed)")
+        return persisted, "persisted"
+
+    external = load_split_manifest(manifest_root, dataset)
+    if external is not None:
+        print(f"[splits] {dataset}: using external frozen manifest "
+              f"{Path(manifest_root) / dataset}")
+        write_split_files(out, external)
+        return external, "external"
+
+    splits = patient_split(patient_ids, seed=split_seed)
+    write_split_files(out, splits)
+    print(f"[splits] {dataset}: generated fixed patient-level 7:1:2 split "
+          f"(split_seed={split_seed}) and persisted to {Path(out) / 'splits'}")
+    return splits, f"generated(split_seed={split_seed})"
 
 
 def write_split_files(out: Path, splits: dict) -> None:
@@ -289,10 +337,8 @@ def prepare_brats2021(raw: Path, out: Path, split_seed: int,
     if not patients:
         raise RuntimeError(f"no BraTS patient directories under {raw}")
 
-    write_split_files(out, resolve_splits(patients, manifest_root,
-                                          "brats2021", split_seed))
-    splits = load_split_manifest(manifest_root, "brats2021") or \
-        patient_split(patients, seed=split_seed)
+    splits, split_source = resolve_splits(patients, manifest_root,
+                                          "brats2021", split_seed, out)
 
     rows = []
     for pid in patients:
@@ -369,9 +415,9 @@ def prepare_brats2021(raw: Path, out: Path, split_seed: int,
         "scale": hr_size // lr_size,
         "component_connectivity": 8,
         "num_classes": 1,
-        "split": "patient-level 7:1:2 (frozen manifest when available)",
+        "split": "patient-level 7:1:2 (fixed, persisted manifest)",
         "split_seed": split_seed,
-        "split_source": "manifest" if load_split_manifest(manifest_root, "brats2021") else "random",
+        "split_source": split_source,
     }
     (out / "protocol.json").write_text(json.dumps(protocol, indent=2))
     return protocol
@@ -397,10 +443,8 @@ def prepare_luna16(raw: Path, out: Path, split_seed: int,
         raise RuntimeError(f"no .mhd scans under {raw}")
 
     patients = [s.stem for s in scans]
-    write_split_files(out, resolve_splits(patients, manifest_root,
-                                          "luna16", split_seed))
-    splits = load_split_manifest(manifest_root, "luna16") or \
-        patient_split(patients, seed=split_seed)
+    splits, split_source = resolve_splits(patients, manifest_root,
+                                          "luna16", split_seed, out)
 
     rows = []
     for scan in scans:
@@ -477,9 +521,9 @@ def prepare_luna16(raw: Path, out: Path, split_seed: int,
         "downsample": "OpenCV INTER_CUBIC",
         "scale": hr_size // lr_size,
         "num_classes": 1,
-        "split": "patient-level 7:1:2 (frozen manifest when available)",
+        "split": "patient-level 7:1:2 (fixed, persisted manifest)",
         "split_seed": split_seed,
-        "split_source": "manifest" if load_split_manifest(manifest_root, "luna16") else "random",
+        "split_source": split_source,
     }
     (out / "protocol.json").write_text(json.dumps(protocol, indent=2))
     return protocol
@@ -568,10 +612,8 @@ def prepare_vindrcxr(raw: Path, out: Path, split_seed: int,
         raise RuntimeError(f"no DICOM files under {raw}")
 
     patients = [p.stem for p in images]
-    write_split_files(out, resolve_splits(patients, manifest_root,
-                                          "vindrcxr", split_seed))
-    splits = load_split_manifest(manifest_root, "vindrcxr") or \
-        patient_split(patients, seed=split_seed)
+    splits, split_source = resolve_splits(patients, manifest_root,
+                                          "vindrcxr", split_seed, out)
 
     annotations, class_map = _read_vindr_annotations(raw)
 
@@ -627,9 +669,9 @@ def prepare_vindrcxr(raw: Path, out: Path, split_seed: int,
         "lr_size": [lr_size, lr_size],
         "downsample": "OpenCV INTER_CUBIC",
         "scale": hr_size // lr_size,
-        "split": "patient-level 7:1:2 (frozen manifest when available)",
+        "split": "patient-level 7:1:2 (fixed, persisted manifest)",
         "split_seed": split_seed,
-        "split_source": "manifest" if load_split_manifest(manifest_root, "vindrcxr") else "random",
+        "split_source": split_source,
     }
     (out / "protocol.json").write_text(json.dumps(protocol, indent=2))
     return protocol
@@ -704,7 +746,12 @@ def main() -> int:
                     choices=["brats2021", "luna16", "vindrcxr"])
     ap.add_argument("--raw", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--split-seed", type=int, default=42)
+    ap.add_argument("--split-seed", type=int, default=SPLIT_SEED_DEFAULT,
+                    help="INDEPENDENT fixed split seed for the patient-level "
+                         "7:1:2 partition; decoupled from the optimisation "
+                         "seeds 42-46 (the optimisation seed never changes "
+                         "the split). The generated manifest is persisted "
+                         "and reused by every later run.")
     ap.add_argument("--split-manifest-root", type=Path, default=None,
                     help="root of frozen split manifests "
                          "(e.g. data/splits); overrides random splits")

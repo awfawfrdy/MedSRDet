@@ -214,6 +214,69 @@ def check_medhead(results: list) -> None:
             f"regression output shape (got {tuple(out['bbox'][0].shape)})", results)
 
 
+def check_split_protocol(results: list) -> None:
+    """Fixed-split contract (Section 4.1): independent split seed, persisted
+    manifests, optimisation seeds 42-46 never change the partition."""
+    print("\n=== Split protocol (Section 4.1: fixed patient-level 7:1:2) ===")
+    import random
+    import tempfile
+
+    from scripts.preprocess import (SPLIT_SEED_DEFAULT, patient_split,
+                                    resolve_splits)
+
+    _expect(SPLIT_SEED_DEFAULT == 42,
+            f"independent split seed default = {SPLIT_SEED_DEFAULT} "
+            "(decoupled from the optimisation seeds)", results)
+
+    ids = [f"p{i:04d}" for i in range(1250)]
+    s = patient_split(ids, seed=SPLIT_SEED_DEFAULT)
+    s = {k: set(v) for k, v in s.items()}
+    _expect((len(s["train"]), len(s["val"]), len(s["test"])) == (875, 125, 250),
+            f"7:1:2 partition exact on 1,250 patients "
+            f"(got {len(s['train'])}/{len(s['val'])}/{len(s['test'])})",
+            results)
+    _expect(not ((s["train"] & s["val"]) or (s["train"] & s["test"])
+                 or (s["val"] & s["test"])),
+            "train/val/test are patient-disjoint (no leakage)", results)
+
+    # Deterministic in (patients, split_seed); the optimisation seed is not an
+    # input of the split generation, so all five training seeds observe the
+    # identical partition.
+    same = all({k: set(v) for k, v in
+                patient_split(ids, seed=SPLIT_SEED_DEFAULT).items()} == s
+               for _ in range(3))
+    _expect(same, "split generation is deterministic in the independent "
+                  "split seed", results)
+
+    # Persistence: once generated, every later resolve_splits call on the same
+    # output directory returns the persisted manifest unchanged.
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        first, src1 = resolve_splits(ids, None, "unit-test", 42, out)
+        first = {k: set(v) for k, v in first.items()}
+        for training_seed in (42, 43, 44, 45, 46):
+            again, src = resolve_splits(ids, None, "unit-test",
+                                        training_seed, out)
+            again = {k: set(v) for k, v in again.items()}
+            if again != first or src != "persisted":
+                _expect(False,
+                        f"persisted manifest changed for training seed "
+                        f"{training_seed} (source={src})", results)
+                break
+        else:
+            _expect(True,
+                    "all five optimisation seeds read the identical persisted "
+                    "manifest (idempotent, never re-generated)", results)
+
+    # Training must never regenerate splits: no split-generation call inside
+    # scripts/train.py.
+    train_src = (Path(__file__).resolve().parents[1]
+                 / "scripts" / "train.py").read_text()
+    _expect("patient_split" not in train_src,
+            "scripts/train.py contains no split-generation call "
+            "(training reads manifests only)", results)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--vgg", action="store_true",
@@ -228,6 +291,7 @@ def main() -> int:
     check_mfasr_loss(results, with_vgg=args.vgg)
     check_cmcl(results)
     check_medhead(results)
+    check_split_protocol(results)
 
     n_ok = sum(1 for r in results if r)
     print(f"\n{n_ok}/{len(results)} checks passed")

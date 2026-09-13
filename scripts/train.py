@@ -33,6 +33,12 @@ Design points that follow the manuscript
 * Ground-truth class ids: VinDr-CXR keeps its native 14-class labels
   (``scripts/preprocess.py``); classification targets are one-hot in the
   dataset's own label space — 14 channels are never averaged into one.
+* Fixed patient-level 7:1:2 split (Section 4.1): generated once by
+  ``scripts/preprocess.py`` under an INDEPENDENT fixed split seed and
+  persisted as ``splits/{train,val,test}_patients.txt``; the optimisation
+  seeds 42-46 never change the data partition — every repeated run reads the
+  identical persisted manifests (verified by ``verify_fixed_splits`` and the
+  smoke tests).
 * Negative sampling (Appendix D.4): 1:1 positive:negative re-randomised per
   epoch applies ONLY to BraTS2021 / LUNA16 *training* slices; validation and
   test keep every eligible slice; VinDr-CXR keeps its image-level annotations
@@ -78,10 +84,49 @@ NEGATIVE_SAMPLING_DATASETS = {"brats2021", "luna16"}
 
 
 def seed_everything(seed: int) -> None:
+    """Seed the OPTIMISATION only.
+
+    Section 4.1: the five random seeds 42-46 vary stochastic optimisation;
+    the data partition is a FIXED patient-level 7:1:2 split persisted by
+    ``scripts/preprocess.py`` and is NEVER regenerated here — every repeated
+    run (any seed in VALID_SEEDS) reads the identical split manifests.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def verify_fixed_splits(data_root: Path, dataset_names: list) -> None:
+    """Assert the persisted split manifests are complete and disjoint.
+
+    Training never regenerates splits: ``SliceDataset`` reads only the
+    manifests written by ``scripts/preprocess.py``.  This guard fails loudly
+    if a manifest is missing, empty, or leaks patients across subsets.
+    """
+    for d in dataset_names:
+        split_dir = Path(data_root) / d / "splits"
+        parts = {}
+        for s in ("train", "val", "test"):
+            f = split_dir / f"{s}_patients.txt"
+            if not f.exists():
+                raise FileNotFoundError(
+                    f"{f} not found — the fixed patient-level split manifest "
+                    "must be persisted by scripts/preprocess.py before "
+                    "training (training seeds 42-46 never change the split)."
+                )
+            parts[s] = {line.strip() for line in f.read_text().splitlines()
+                        if line.strip()}
+            if not parts[s]:
+                raise ValueError(f"{f} is empty")
+        if not (parts["train"] & parts["val"]).issubset({}) or \
+           (parts["train"] & parts["test"]) or (parts["val"] & parts["test"]):
+            raise ValueError(
+                f"{d}: patient leakage across train/val/test subsets"
+            )
+        print(f"[splits] {d}: train={len(parts['train'])} "
+              f"val={len(parts['val'])} test={len(parts['test'])} "
+              f"(disjoint, persisted manifest)")
 
 
 # --------------------------------------------------------------------------- #
@@ -514,6 +559,10 @@ def main() -> int:
     root = Path(args.data_root)
     dataset_names = ["brats2021", "luna16", "vindrcxr"]
     dataset_nc = {d: cfg["datasets"][d]["num_classes"] for d in dataset_names}
+
+    # Section 4.1: fixed patient-level 7:1:2 split — verified once, then read
+    # identically by every repeated run (training seeds 42-46).
+    verify_fixed_splits(root, dataset_names)
 
     common = dict(hr_size=cfg["common"]["hr_size"],
                   lr_size=cfg["common"]["lr_size"], seed=args.seed)
