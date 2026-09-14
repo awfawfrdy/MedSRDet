@@ -125,7 +125,9 @@ reproducible: `scripts/gen_vindr_manifest.py` derives the same fixed 7:1:2
 partition under the independent split seed 42 directly from the official
 release.  VinDr-CXR publishes only anonymised image IDs, so its partition is
 defined over image IDs; BraTS2021 and LUNA16 are partitioned at the patient
-level.
+level.  The manifest is regenerable but not redistributed — reproduction steps
+and the exact split specification are documented in
+[`data/splits/vindr/README.md`](data/splits/vindr/README.md).
 
 ---
 
